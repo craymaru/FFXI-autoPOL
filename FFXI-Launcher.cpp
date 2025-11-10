@@ -370,6 +370,34 @@ void writeConfigFile(const std::string& path, const GlobalConfig& config) {
     file << j.dump(4);
 }
 
+// Helper function to parse comma-separated ports
+std::vector<int> parsePorts(const std::string& input) {
+    std::vector<int> ports;
+    if (input.empty()) {
+        return ports;
+    }
+    
+    std::stringstream ss(input);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        // Trim whitespace
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        
+        if (token.empty()) continue;
+        
+        // Check if all characters are digits
+        if (std::all_of(token.begin(), token.end(), ::isdigit)) {
+            int port = std::stoi(token);
+            if (port >= 1 && port <= 65535) {
+                ports.push_back(port);
+            }
+        }
+    }
+    
+    return ports;
+}
+
 GlobalConfig loadConfig(const std::string& path) {
     GlobalConfig config;
     std::string content = readConfigFile(path);
@@ -421,6 +449,24 @@ void setupConfig(GlobalConfig& config) {
         int val = std::stoi(input);
         if (val >= 1 && val <= 20) config.delay = val * 1000;
     }
+    
+    // Port configuration
+    config.ports.clear();
+    std::cout << "Ports (comma-separated, e.g. 51304,51305 or leave empty for default 51304): ";
+    std::getline(std::cin, input);
+    if (input.empty()) {
+        // Default to single port 51304
+        config.ports = DEFAULT_PORTS;
+    } else {
+        std::vector<int> parsedPorts = parsePorts(input);
+        if (parsedPorts.empty()) {
+            std::cout << "No valid ports found, using default port 51304.\n";
+            config.ports = DEFAULT_PORTS;
+        } else {
+            config.ports = parsedPorts;
+        }
+    }
+    
     int numAccounts = 0;
     while (true) {
         std::cout << "How many characters do you want to set up? ";
@@ -1062,6 +1108,7 @@ bool editConfig(GlobalConfig& config) {
         std::cout << "  [A] Add new character\n";
         std::cout << "  [D] Delete character\n";
         std::cout << "  [C] Modify timeout\n";
+        std::cout << "  [P] Modify ports\n";
         std::cout << "  [X] Exit to selection screen\n";
         std::cout << "Enter option: ";
         std::getline(std::cin, input);
@@ -1172,6 +1219,32 @@ bool editConfig(GlobalConfig& config) {
                     config.delay = val * 1000;
                     std::cout << "Timeout updated.\n";
                 }
+            }
+        } else if (input == "p") {
+            std::cout << "Current ports: ";
+            if (config.ports.empty()) {
+                std::cout << "none (using default 51304)\n";
+            } else {
+                for (size_t i = 0; i < config.ports.size(); ++i) {
+                    std::cout << config.ports[i];
+                    if (i < config.ports.size() - 1) {
+                        std::cout << ", ";
+                    }
+                }
+                std::cout << "\n";
+            }
+            std::cout << "New ports (comma-separated, e.g. 51304,51305 or leave empty to keep current): ";
+            std::getline(std::cin, input);
+            if (!input.empty()) {
+                std::vector<int> parsedPorts = parsePorts(input);
+                if (parsedPorts.empty()) {
+                    std::cout << "No valid ports found, keeping current ports.\n";
+                } else {
+                    config.ports = parsedPorts;
+                    std::cout << "Ports updated.\n";
+                }
+            } else {
+                std::cout << "Ports unchanged.\n";
             }
         } else if (input == "x") {
             return false; // Return to selection screen

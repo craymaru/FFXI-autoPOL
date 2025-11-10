@@ -67,10 +67,14 @@ struct GlobalConfig {
     int delay;
     bool POLProxy;
     std::vector<AccountConfig> accounts;
+    std::vector<int> ports;
 };
 
 #define SHA1_BLOCK_SIZE 64
 #define SHA1_DIGEST_LENGTH 20
+
+// Default ports
+static const std::vector<int> DEFAULT_PORTS = {51304};
 
 std::string base32_decode(const std::string& input) {
     const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -267,6 +271,19 @@ void copyAndPasteText(HWND hwnd, const std::string& text) {
     }
     
     Sleep(500);
+    
+    // Restore clipboard to original content (for security)
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        if (!originalClipboard.empty()) {
+            HGLOBAL hGlob = GlobalAlloc(GMEM_FIXED, originalClipboard.length() + 1);
+            if (hGlob != NULL) {
+                strcpy_s(static_cast<char*>(hGlob), originalClipboard.length() + 1, originalClipboard.c_str());
+                SetClipboardData(CF_TEXT, hGlob);
+            }
+        }
+        CloseClipboard();
+    }
 }
 
 void sendText(HWND hwnd, const std::string& text, int delay = 50) {
@@ -348,6 +365,7 @@ void writeConfigFile(const std::string& path, const GlobalConfig& config) {
         accounts.push_back(acc);
     }
     j["accounts"] = accounts;
+    j["ports"] = config.ports;
     std::ofstream file(path);
     file << j.dump(4);
 }
@@ -356,6 +374,8 @@ GlobalConfig loadConfig(const std::string& path) {
     GlobalConfig config;
     std::string content = readConfigFile(path);
     if (content.empty()) {
+        // Set default ports
+        config.ports = DEFAULT_PORTS;
         return config;
     }
     try {
@@ -373,8 +393,19 @@ GlobalConfig loadConfig(const std::string& path) {
                 config.accounts.push_back(account);
             }
         }
+        if (j.contains("ports")) {
+            config.ports.clear();
+            for (const auto& port : j["ports"]) {
+                config.ports.push_back(port);
+            }
+        } else {
+            // Set default ports
+            config.ports = DEFAULT_PORTS;
+        }
     } catch (const std::exception& e) {
         std::cerr << "Error parsing config file: " << e.what() << std::endl;
+        // Set default ports on error
+        config.ports = DEFAULT_PORTS;
     }
     return config;
 }
@@ -534,10 +565,13 @@ void launchAccount(const AccountConfig& account, const GlobalConfig& config) {
     if (testSocket == INVALID_SOCKET) {
         std::cerr << "Failed to create socket for port check.\n";
     } else {
+        // Determine port to check (first port from config.ports or first default port)
+        int checkPort = (!config.ports.empty()) ? config.ports[0] : DEFAULT_PORTS[0];
+        
         sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
         inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
-        serverAddr.sin_port = htons(51304);
+        serverAddr.sin_port = htons(checkPort);
         
         // Set socket options before bind
         int opt = 1;
@@ -551,7 +585,7 @@ void launchAccount(const AccountConfig& account, const GlobalConfig& config) {
             } else {
                 if (bind(testSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
                     DWORD error = WSAGetLastError();
-                    std::cerr << "POL Redirect won't work: Port 51304 is already in use (Error: " << error << ")\n";
+                    std::cerr << "POL Redirect won't work: Port " << checkPort << " is already in use (Error: " << error << ")\n";
                 } else {
                     portAvailable = true;
                     if (config.POLProxy) {
@@ -564,6 +598,7 @@ void launchAccount(const AccountConfig& account, const GlobalConfig& config) {
     }
 
     std::cout << "Launching character: " << account.name << std::endl;
+    std::cout.flush();
 
     // Defocus any existing POL window before launching new one
     defocusExistingPOL();
@@ -797,105 +832,226 @@ void launchAccount(const AccountConfig& account, const GlobalConfig& config) {
 
 std::atomic<bool> shouldExit(false);
 
-void startProxyServer() {
+void startProxyServer(const GlobalConfig& config) {
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "Server failed to start\n";
         return;
     }
 
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (serverSocket == INVALID_SOCKET) {
-        std::cerr << "Port creation failed\n";
-        WSACleanup();
-        return;
+    // Load port list from config.json
+    std::vector<int> ports = config.ports;
+    if (ports.empty()) {
+        // Set default ports
+        ports = DEFAULT_PORTS;
     }
-
-    // Set socket options before bind
-    int opt = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) < 0) {
-        std::cerr << "setsockopt SO_REUSEADDR failed\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return;
-    }
-
-    // Try to set SO_EXCLUSIVEADDRUSE to false
-    opt = 0;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char*)&opt, sizeof(opt)) < 0) {
-        std::cerr << "setsockopt SO_EXCLUSIVEADDRUSE failed\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return;
-    }
-
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
-    serverAddr.sin_port = htons(51304);
-
-    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        DWORD error = WSAGetLastError();
-        std::cerr << "Bind failed with error: " << error << " (";
-        switch (error) {
-            case WSAEADDRINUSE:
-                std::cerr << "Port Address already in use";
-                break;
-            case WSAEACCES:
-                std::cerr << "Port Access denied";
-                break;
-            case WSAEINVAL:
-                std::cerr << "Port Invalid argument";
-                break;
-            default:
-                std::cerr << "Port Unknown error";
-        }
-        std::cerr << ")\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return;
-    }
-
-    if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "Listen failed with error: " << WSAGetLastError() << "\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return;
-    }
-
-    while (!shouldExit) {
-        SOCKET clientSocket = accept(serverSocket, NULL, NULL);
-        if (clientSocket == INVALID_SOCKET) {
-            std::cerr << "Accept failed with error: " << WSAGetLastError() << "\n";
+    std::vector<SOCKET> serverSockets;
+    
+    for (int port : ports) {
+        SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (serverSocket == INVALID_SOCKET) {
+            std::cerr << "[Server] Port " << port << " socket creation failed\n";
             continue;
         }
+
+        // Set socket options before bind
+        int opt = 1;
+        if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) < 0) {
+            std::cerr << "[Server] Port " << port << " setsockopt SO_REUSEADDR failed\n";
+            closesocket(serverSocket);
+            continue;
+        }
+
+        // Try to set SO_EXCLUSIVEADDRUSE to false
+        opt = 0;
+        if (setsockopt(serverSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char*)&opt, sizeof(opt)) < 0) {
+            std::cerr << "[Server] Port " << port << " setsockopt SO_EXCLUSIVEADDRUSE failed\n";
+            closesocket(serverSocket);
+            continue;
+        }
+
+        sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+        serverAddr.sin_port = htons(port);
+
+        if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            DWORD error = WSAGetLastError();
+            if (error != WSAEADDRINUSE) {
+                std::cerr << "[Server] Port " << port << " bind failed with error: " << error << "\n";
+            }
+            closesocket(serverSocket);
+            continue;
+        }
+
+        if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
+            std::cerr << "[Server] Port " << port << " listen failed with error: " << WSAGetLastError() << "\n";
+            closesocket(serverSocket);
+            continue;
+        }
+
+        serverSockets.push_back(serverSocket);
+        std::cout << "[Server] Listening on port " << port << std::endl;
+        std::cout.flush();
+    }
+
+    if (serverSockets.empty()) {
+        std::cerr << "[Server] Failed to bind to any port\n";
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "[Server] Server started, listening on " << serverSockets.size() << " ports" << std::endl;
+    std::cout.flush();
+
+    while (!shouldExit) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        SOCKET maxSocket = 0;
+        
+        for (SOCKET sock : serverSockets) {
+            FD_SET(sock, &readSet);
+            if (sock > maxSocket) maxSocket = sock;
+        }
+
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int selectResult = select(0, &readSet, NULL, NULL, &timeout);
+        if (selectResult == SOCKET_ERROR) {
+            std::cerr << "[Server] Select failed with error: " << WSAGetLastError() << "\n";
+            std::cerr.flush();
+            continue;
+        }
+
+        if (selectResult == 0) {
+            // Timeout, continue loop
+            continue;
+        }
+
+        // Find socket with incoming connection
+        SOCKET clientSocket = INVALID_SOCKET;
+        int acceptedPort = 0;
+        for (SOCKET sock : serverSockets) {
+            if (FD_ISSET(sock, &readSet)) {
+                sockaddr_in clientAddr;
+                int addrLen = sizeof(clientAddr);
+                clientSocket = accept(sock, (sockaddr*)&clientAddr, &addrLen);
+                if (clientSocket != INVALID_SOCKET) {
+                    acceptedPort = ntohs(clientAddr.sin_port);
+                    // Get actual connection port
+                    sockaddr_in localAddr;
+                    int localAddrLen = sizeof(localAddr);
+                    getsockname(sock, (sockaddr*)&localAddr, &localAddrLen);
+                    acceptedPort = ntohs(localAddr.sin_port);
+                    break;
+                }
+            }
+        }
+
+        if (clientSocket == INVALID_SOCKET) {
+            continue;
+        }
+
+        std::cout << "[Server] Connection accepted on port " << acceptedPort << std::endl;
+        std::cout.flush();
+        
         char buffer[4096];
         int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        std::cout << "[Server] Received " << bytesReceived << " bytes" << std::endl;
+        std::cout.flush();
+        
         if (bytesReceived > 0) {
             buffer[bytesReceived] = '\0';
-            if (strstr(buffer, "GET /pml/main/index.pml") != nullptr) {
+            
+            // Log entire request (first 500 characters)
+            std::string requestPreview(buffer);
+            if (requestPreview.length() > 500) {
+                requestPreview = requestPreview.substr(0, 500) + "...";
+            }
+            std::cout << "[Server] Request data: " << requestPreview << std::endl;
+            std::cout.flush();
+            
+            // Extract path from first line of request
+            std::string request(buffer);
+            std::string path = "";
+            size_t firstSpace = request.find(' ');
+            if (firstSpace != std::string::npos) {
+                size_t secondSpace = request.find(' ', firstSpace + 1);
+                if (secondSpace != std::string::npos) {
+                    path = request.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+                }
+            }
+            
+            // Log path
+            std::cout << "[Server] Request path: " << path << std::endl;
+            std::cout.flush();
+            
+            if (path == "/pml/main/index.pml") {
+                std::cout << "[Server] Responding with PML content" << std::endl;
+                std::cout.flush();
                 std::string response = "HTTP/1.1 200 OK\r\n"
                                      "Content-Type: text/x-playonline-pml;charset=UTF-8\r\n"
                                      "Content-Length: 123\r\n"
                                      "Connection: close\r\n"
                                      "\r\n"
                                      "<pml><head><meta http-equiv=\"Content-Type\" content=\"text/x-playonline-pml;charset=UTF-8\"><title>Fast</title></head><body><timer name=\"fast\" href=\"gameto:1\" enable=\"1\" delay=\"0\"></body></pml>";
-                send(clientSocket, response.c_str(), response.length(), 0);
+                int sent = send(clientSocket, response.c_str(), response.length(), 0);
+                if (sent == SOCKET_ERROR) {
+                    std::cerr << "[Server] Send failed with error: " << WSAGetLastError() << "\n";
+                    std::cerr.flush();
+                } else {
+                    std::cout << "[Server] Sent " << sent << " bytes" << std::endl;
+                    std::cout.flush();
+                }
+                // Wait for send to complete
+                shutdown(clientSocket, SD_SEND);
+                // Give client time to receive data
+                Sleep(100);
+                std::cout << "[Server] Setting shouldExit = true" << std::endl;
+                std::cout.flush();
                 shouldExit = true;
             } else {
+                std::cout << "[Server] Unknown path, returning 404" << std::endl;
+                std::cout.flush();
                 std::string response = "HTTP/1.1 404 Not Found\r\n"
                                      "Content-Type: text/plain\r\n"
                                      "Content-Length: 13\r\n"
                                      "Connection: close\r\n"
                                      "\r\n"
                                      "Not Found";
-                send(clientSocket, response.c_str(), response.length(), 0);
+                int sent = send(clientSocket, response.c_str(), response.length(), 0);
+                if (sent == SOCKET_ERROR) {
+                    std::cerr << "[Server] Send failed with error: " << WSAGetLastError() << "\n";
+                    std::cerr.flush();
+                } else {
+                    std::cout << "[Server] Sent " << sent << " bytes (404)" << std::endl;
+                    std::cout.flush();
+                }
+                // Wait for send to complete
+                shutdown(clientSocket, SD_SEND);
+                Sleep(100);
             }
+        } else if (bytesReceived == 0) {
+            std::cout << "[Server] Connection closed by client" << std::endl;
+            std::cout.flush();
+        } else {
+            std::cerr << "[Server] recv failed with error: " << WSAGetLastError() << "\n";
+            std::cerr.flush();
         }
         closesocket(clientSocket);
     }
-    closesocket(serverSocket);
+    std::cout << "[Server] Exiting server loop, closing all server sockets" << std::endl;
+    std::cout.flush();
+    for (SOCKET sock : serverSockets) {
+        closesocket(sock);
+    }
+    std::cout << "[Server] All server sockets closed, cleaning up WSA" << std::endl;
+    std::cout.flush();
     WSACleanup();
+    std::cout << "[Server] Server thread exiting" << std::endl;
+    std::cout.flush();
 }
 
 bool editConfig(GlobalConfig& config) {
@@ -1114,14 +1270,18 @@ int main(int argc, char* argv[]) {
         // If more than one account and no character specified, prompt user
         if (characterName.empty() && config.accounts.size() > 1) {
             std::cout << "\nSelect a character to log in with:\n";
+            std::cout.flush();
             for (size_t i = 0; i < config.accounts.size(); ++i) {
                 std::cout << "  [" << (i + 1) << "] " << config.accounts[i].name << " (slot " << config.accounts[i].slot << ")\n";
+                std::cout.flush();
             }
             std::cout << "  [E] Edit configuration\n";
+            std::cout.flush();
             std::string input;
             int choice = 0;
             while (true) {
                 std::cout << "Enter number (1-" << config.accounts.size() << ") or 'E' to edit configuration: ";
+                std::cout.flush();
                 std::getline(std::cin, input);
                 std::string lowerInput = input;
                 std::transform(lowerInput.begin(), lowerInput.end(), lowerInput.begin(), ::tolower);
@@ -1150,8 +1310,6 @@ int main(int argc, char* argv[]) {
                 continue; // Go back to selection if editConfig returned
             }
         }
-        // Always start proxy server
-        std::thread proxyThread(startProxyServer);
         // Find the account to launch
         AccountConfig* toLaunch = nullptr;
         if (characterName.empty()) {
@@ -1162,6 +1320,7 @@ int main(int argc, char* argv[]) {
                 // If multiple accounts, we should have already prompted for selection
                 // This is just a fallback
                 std::cout << "No account selected. Please specify a character name.\n";
+                std::cout.flush();
                 return 1;
             }
         } else {
@@ -1171,14 +1330,30 @@ int main(int argc, char* argv[]) {
         }
         if (!toLaunch) {
             std::cout << "No account found for requested character name.\n";
+            std::cout.flush();
             return 1;
         }
+        // Start proxy server after character selection is complete
+        std::thread proxyThread([&config]() { startProxyServer(config); });
+        // Give server thread time to start
+        Sleep(100);
         launchAccount(*toLaunch, config);
         // Wait for a request, then exit
+        std::cout << "[Main] Waiting for server to exit..." << std::endl;
+        std::cout.flush();
         while (!shouldExit) { Sleep(100); }
+        std::cout << "[Main] shouldExit is true, joining proxy thread..." << std::endl;
+        std::cout.flush();
         proxyThread.join();
+        std::cout << "[Main] Proxy thread joined, removing hosts entry..." << std::endl;
+        std::cout.flush();
         // Remove hosts entry before exiting
         removeHostsEntry();
+        std::cout << "[Main] Exiting..." << std::endl;
+        std::cout.flush();
+        std::cout << "Press any key to exit (or wait 5 seconds)..." << std::endl;
+        std::cout.flush();
+        Sleep(5000);
         return 0;
     }
     return 0;

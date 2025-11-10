@@ -1,3 +1,6 @@
 .vs/*
 Release/*
 FFXI-Launcher/*
+
+*.exe
+*.pdb
